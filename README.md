@@ -105,7 +105,14 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 - 取书超时释放：`POST /api/holds/jobs/expire`（定时任务每小时自动执行，也可手动触发）
 - 物流丢包：`POST /api/transfers/tasks/{id}/lost` → 馆藏置 LOST、生成 `LOGISTICS` 赔偿单、读者免责保位并自动重新调拨
 - 读者取消：`POST /api/holds/{id}/cancel`（未出库立即解锁；在途则到馆释放给下一位）
-- 声称已还：`POST /api/claims/loans/{loanId}` → 馆员 `.../found`（入库并豁免逾期）、`.../not-found`（赔书价）、`.../waive`（馆方豁免，必填理由）
+- 声称已还/已还未入库申诉（见第 8 节完整流程）：
+  - 读者申报：`POST /api/claims/loans/{loanId}`（可附还书机编号 `machineCode`）→ **受理即冻结逾期罚款**（不撤销、不增长、不催收），借阅进 `CLAIMED_RETURNED`，**借阅信用不立即恢复**
+  - 读者继续举证：`POST /api/claims/{id}/evidence`；证据链查询：`GET /api/claims/{id}/evidence`
+  - 馆员四类核查：`POST /api/claims/{id}/checks/{KIOSK|CAMERA|BIN|SHELF}`（还书机日志 / 监控编号 / 书箱清点 / 馆员入库记录，结论 `MATCH/NOT_FOUND/NA`）；还书机日志由 `POST /api/kiosk/logs` 上报（`SCAN_SUCCESS`/`SCAN_FAILED` 均留痕）
+  - 自助机扫描失败但书找到：`POST /api/claims/{id}/scan-fail-found` → **罚款撤销、库存修正、借阅结案、信用修复**
+  - 首轮未找到：`POST /api/claims/{id}/not-found` → **不判赔，争议保持 `DISPUTED`**；读者补证据后馆员 `POST /api/claims/{id}/reopen` 重开
+  - 最终定责：`POST /api/claims/{id}/reader-liable`（书已还回：逾期**按原到期日**计、信用不恢复；书未找到：赔书价 + 丢书信用扣分）；`POST /api/claims/{id}/library-liable`（馆方漏入库：撤罚、入库流转、**信用记录同案修复**）
+  - 借阅信用：`GET /api/credit/readers/{cardNo}`（初始 100）、`GET /api/credit/readers/{cardNo}/events`（流水）；日终批处理可手动触发 `POST /api/loans/jobs/daily-overdue`
 - 污损/缺页/附件：还书接口置位 → 分别生成赔偿单，污损书退出预约流转
 - 临时闭馆：`POST /api/libraries/{code}/closure` → 在该馆待取预约与临期借阅自动顺延 `closure.graceHours`
 - 罚款人工调整：`POST /api/fines/{id}/adjustments`（REDUCE/WAIVE，必须填理由；原值/新值/操作人/规则依据全部审计留痕，`GET /api/fines/{id}/adjustments` 可查）
@@ -116,7 +123,9 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 - `holds` 预约：`QUEUED → READY → BORROWED`；异常 `CANCELLED / EXPIRED / LOST`。
 - `transfer_tasks` 调拨：`CREATED → PICKED_UP → ARRIVED`；异常 `LOST / CANCELLED`；按 `transfer_batches` 物流批次聚合包裹。
 - `loans` 借阅：`ACTIVE → RETURNED`；争议 `CLAIMED_RETURNED`；确认丢失 `LOST`。
-- `fines` 罚款/赔偿：类型含逾期、污损、缺页、附件、赔书、物流丢包、人工；承担方 `READER / LIBRARY / LOGISTICS`；状态 `OPEN / PAID / WAIVED / REDUCED`，调整记录在 `fine_adjustments`。
+- `claims` 已还未入库申诉：`OPEN 核查中 → DISPUTED 争议保持（可 reopen 回 OPEN）→ FOUND 扫描失败找到 / LIBRARY_LIABLE 馆方漏入库 / READER_LIABLE 读者责任 / WAIVED 馆方豁免`。工单上分别留痕四项核查结论 `kiosk/camera/bin/shelf`（PENDING/MATCH/NOT_FOUND/NA）与证据链 `claim_evidence`。
+- `fines` 罚款/赔偿：类型含逾期、污损、缺页、附件、赔书、物流丢包、人工；承担方 `READER / LIBRARY / LOGISTICS`；状态 `OPEN / PAID / WAIVED / REDUCED`，调整记录在 `fine_adjustments`；申诉受理后逾期单置 `frozen_claim_id` **冻结挂起**。
+- `credit_events` 借阅信用流水：逾期 -5、丢书 -20、馆方责任 `REPAIR` 同案正分修复；信用分 = 100 + 流水之和。
 
 一致性设计要点：
 
@@ -140,11 +149,24 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 
 每条罚款都携带 `ruleBasis`（规则依据文案），馆员处理异常与人工调整时可直接向读者解释；调减/豁免强制填写理由并保留原值、新值、操作人、时间戳。
 
-## 7. 本次实际执行过的验证
+## 7. “已还未入库”申诉处理规则
 
-- `mvn test`：**13 个测试全部通过**（H2 + 真实 Flyway 迁移）：
-  - `LibraryFlowTests`（11 个端到端业务流程）：检索视图与外馆保护、跨馆调拨全链路、FIFO 排队与超时释放、保护比例收紧、物流丢包保位重拨与物流赔偿、出库前/在途取消、逾期罚款累计封顶/逾期阻借/排队阻续、污损缺页附件赔偿与退出流转、声称已还三种结案与人工调整审计、临时闭馆双顺延、管理端统计一致性。
-  - `WebApiTests`（2 个 HTTP 冒烟）：REST JSON、参数校验 400、OpenAPI 3 文档与 Swagger UI 可访问。
+读者收到逾期提醒，但称已在自助还书机还书、系统却未入库。馆员按四类证据核查：**还书机日志、监控编号、书箱清点、馆员入库记录**。
+
+1. **受理即冻结**：读者提交申诉后，借阅进入争议状态；该借阅已产生的逾期罚款**立即冻结**在受理时刻金额——不撤销、不增长、不催收（`fines.frozen_claim_id/frozen_at`）；尚无逾期单则不新建。日终批处理（每日 02:00，也可 `POST /api/loans/jobs/daily-overdue` 手动触发）跳过争议借阅。
+2. **信用不立即恢复**：受理前因逾期扣的信用分（-5）保持，争议期间也不新增扣分；只有最终确认馆方责任才修复。
+3. **四类核查分别留痕**：馆员可多次录入 KIOSK/CAMERA/BIN/SHELF 结论（`MATCH/NOT_FOUND/NA`），还书机核查可关联具体日志；自助机投书即记录，`SCAN_FAILED`（扫描头故障、条码未解析）也保留书箱号与监控编号。所有结论与读者举证进入 `claim_evidence` 证据链。
+4. **扫描失败但书找到**：书在书箱清点/架上找到，确认系设备/入库流程问题 → 罚款撤销、馆藏状态与所在馆修正（重新参与预约流转）、借阅结案、**信用同案修复**。
+5. **书未找到不立即判赔**：首轮核查无果 → 工单置 `DISPUTED` 争议保持，罚款继续冻结；读者可继续提供证据（凭条、同行人、具体时间等），馆员据新证据 `reopen` 回 `OPEN` 再次核查。
+6. **最终定责**：
+   - **读者责任**：书最终还回——逾期罚款一律**按原到期日 → 实际还回时刻**重新核算（申诉处理期不免计），信用扣分维持不恢复；书确认丢失——按 `fee.replacement` 赔书并计丢书信用扣分（-20）。
+   - **馆方漏入库/设备故障**：读者侧未结罚款全部撤销，图书入库正常流转，该借阅此前的信用扣减逐笔等额写 `REPAIR` 正分修复，信用恢复到争议前水平。
+
+## 8. 本次实际执行过的验证
+
+- `mvn test`：**17 个测试全部通过**（H2 + 真实 Flyway 迁移 V1–V3）：
+  - `LibraryFlowTests`（14 个端到端业务流程）：检索视图与外馆保护、跨馆调拨全链路、FIFO 排队与超时释放、保护比例收紧、物流丢包保位重拨与物流赔偿、出库前/在途取消、逾期罚款累计封顶/逾期阻借/排队阻续、污损缺页附件赔偿与退出流转、已还未入库馆方找到撤罚修复信用 / 最终读者责任赔书与人工调整审计、**罚款冻结期间金额不增且信用不恢复 → 自助机扫描失败找到撤罚修库存修信用**、**最终读者责任（书已还回）逾期按原到期日计、信用不恢复**、**未逾期判读者责任不产生罚款与信用扣分**、临时闭馆双顺延、管理端统计一致性。
+  - `WebApiTests`（3 个 HTTP 冒烟）：REST JSON、参数校验 400、OpenAPI 3 文档与 Swagger UI 可访问；**已还未入库申诉完整 HTTP 链路**（自助机 SCAN_FAILED 上报 → 申诉受理冻结 → 读者举证/馆员核查 → 扫描失败找到馆方定责 → 信用 100）。
 - `mvn package`：构建出 `target/city-library.jar`（约 57 MB，可执行 fat jar）。
-- 真实数据库冒烟：已在本机用 **PostgreSQL 15** 实际启动该 JAR（Flyway 建表播种成功），并通过 curl 走通“中文检索（URL 编码）→ 预约锁定城东条码 `C-0004` → 出库批次/包裹号/ETA=72h → 到馆 WEST → 借出（应还日期 +30 天）→ 管理端总览（到馆率 100%）→ Swagger UI / OpenAPI JSON 均 200”全链路。
-- 未执行项：本环境无 Docker 守护进程，`docker compose up` 未在本机实际运行；Dockerfile 采用标准 Maven 多阶段构建 + eclipse-temurin:17-jre，且 compose 使用的 PostgreSQL 建表迁移脚本已在上述真实 PG 15 实例上验证通过。
+- 真实数据库冒烟：已在本机用 **PostgreSQL 15** 实际启动该 JAR（Flyway V1–V3 建表播种成功），除原有跨馆调拨全链路外，本次走通申诉主场景：**借出 → 制造逾期 → 日终批处理生成逾期提醒/6 元罚款/信用 95 → 申诉受理后罚款冻结为 6 元（把逾期改到 72 天前再跑批，金额仍 6、信用仍 95）→ KIOSK/CAMERA/BIN 核查 MATCH → 馆方漏入库定责 → 罚款 WAIVED 0 元、库存修正为 AVAILABLE、信用修复回 100（REPAIR +5 流水）、通知送达**；并验证 `DISPUTED 争议保持 → 读者补证据 → reopen → 读者责任定责`、争议态直接核查返回 409 等分支；Swagger UI / OpenAPI JSON 含全部新接口均 200。
+- 未执行项：本环境无 Docker 守护进程，`docker compose up` 未在本机实际运行；Dockerfile 采用标准 Maven 多阶段构建 + eclipse-temurin:17-jre，且 compose 使用的 PostgreSQL 建表迁移脚本（含 V3）已在上述真实 PG 15 实例上验证通过。

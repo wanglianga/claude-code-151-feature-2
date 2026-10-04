@@ -8,5 +8,6 @@ public record ReaderStatsRow(
         long overdueLoans,
         long openClaims,
         long openFines,
-        double openFineAmount
+        double openFineAmount,
+        int creditScore
 ) {}

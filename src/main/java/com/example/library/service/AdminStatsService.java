@@ -27,10 +27,12 @@ public class AdminStatsService {
     private final ItemRepository items;
     private final BibRepository bibs;
     private final LibraryRepository libraries;
+    private final CreditService credit;
 
     public AdminStatsService(TransferTaskRepository tasks, TransferBatchRepository batches,
                              HoldRepository holds, LoanRepository loans, FineRepository fines,
-                             ItemRepository items, BibRepository bibs, LibraryRepository libraries) {
+                             ItemRepository items, BibRepository bibs, LibraryRepository libraries,
+                             CreditService credit) {
         this.tasks = tasks;
         this.batches = batches;
         this.holds = holds;
@@ -39,6 +41,7 @@ public class AdminStatsService {
         this.items = items;
         this.bibs = bibs;
         this.libraries = libraries;
+        this.credit = credit;
     }
 
     @Transactional(readOnly = true)
@@ -147,7 +150,7 @@ public class AdminStatsService {
                     long queued = holds.findActiveByReaderCard(r.getCardNo(),
                             List.of(HoldStatus.QUEUED, HoldStatus.READY)).size();
                     return new ReaderStatsRow(r.getCardNo(), r.getName(), queued, active, overdue, claims,
-                            openFines, round(openAmount));
+                            openFines, round(openAmount), credit.score(r.getCardNo()));
                 })
                 .sorted(Comparator.comparingDouble(ReaderStatsRow::openFineAmount).reversed())
                 .toList();

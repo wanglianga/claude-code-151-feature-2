@@ -15,7 +15,7 @@ import java.time.Instant;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-/** REST 层冒烟：检索、预约全链路、参数校验、管理端、OpenAPI/Swagger。 */
+/** REST 层冒烟：检索、预约全链路、参数校验、管理端、OpenAPI/Swagger、已还未入库申诉。 */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
@@ -93,6 +93,86 @@ class WebApiTests {
         mvc.perform(get("/api/admin/batches")).andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].packages").value(1));
         mvc.perform(get("/api/admin/policies")).andExpect(status().isOk())
-                .andExpect(jsonPath("$.['fine.daily']").value(0.5));
+                .andExpect(jsonPath("$['fine.daily']").value(0.5));
+    }
+
+    @Test
+    void returnedNotCheckedInClaimFlowOverHttp() throws Exception {
+        // R001 在中心馆借出解忧杂货店
+        var checkout = mvc.perform(post("/api/loans/checkouts")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"readerCardNo":"R001","itemBarcode":"J-0001","libraryCode":"CENTRAL"}
+                                """))
+                .andExpect(status().isCreated()).andReturn();
+        Number loanIdNum = com.jayway.jsonpath.JsonPath.read(
+                checkout.getResponse().getContentAsString(), "$.id");
+        Long loanId = loanIdNum.longValue();
+
+        // 自助机上报一条扫描失败日志（条码未解析）
+        mvc.perform(post("/api/kiosk/logs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"machineCode":"KIOSK-C-01","libraryCode":"CENTRAL","result":"SCAN_FAILED",
+                                 "binNo":"BIN-C-2","cameraRef":"CAM-C-09","note":"扫描头故障"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.result").value("SCAN_FAILED"));
+
+        // 读者申诉“已还未入库”，附还书机编号 → OPEN
+        var claimResp = mvc.perform(post("/api/claims/loans/" + loanId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"note":"昨晚投到中心馆自助机了","machineCode":"KIOSK-C-01"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("OPEN"))
+                .andExpect(jsonPath("$.frozenAt").exists())
+                .andReturn();
+        Number claimIdNum = com.jayway.jsonpath.JsonPath.read(
+                claimResp.getResponse().getContentAsString(), "$.id");
+        Long claimId = claimIdNum.longValue();
+
+        // 读者补充证据
+        mvc.perform(post("/api/claims/" + claimId + "/evidence")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"kind":"RECEIPT","content":"自助机打印的还书凭条编号 RC20261003"}
+                                """))
+                .andExpect(status().isOk());
+
+        // 馆员录入还书机核查 MATCH（缺 staff → 400）
+        mvc.perform(post("/api/claims/" + claimId + "/checks/KIOSK")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"result\":\"MATCH\"}"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(post("/api/claims/" + claimId + "/checks/KIOSK")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"staff":"馆员老周","result":"MATCH","note":"故障时段有投书失败记录"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.kioskCheck").value("MATCH"));
+
+        // 证据链可查（受理说明 + 读者凭条 + 馆员核查共 3 条）
+        mvc.perform(get("/api/claims/" + claimId + "/evidence"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(3));
+
+        // 扫描失败但书在书箱找到 → 馆方责任结案
+        mvc.perform(post("/api/claims/" + claimId + "/scan-fail-found")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"staff":"馆员老周","foundLibraryCode":"CENTRAL","binNo":"BIN-C-2",
+                                 "note":"书箱清点找到 J-0001"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("LIBRARY_LIABLE"))
+                .andExpect(jsonPath("$.liability").value("LIBRARY"));
+
+        // 库存已修正为在馆可借；信用分接口可用
+        mvc.perform(get("/api/credit/readers/R001"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.creditScore").value(100));
     }
 }

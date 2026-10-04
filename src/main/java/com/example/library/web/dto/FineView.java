@@ -15,5 +15,7 @@ public record FineView(
         String reason,
         String ruleBasis,
         Instant createdAt,
-        Instant resolvedAt
+        Instant resolvedAt,
+        boolean frozen,
+        Long frozenClaimId
 ) {}

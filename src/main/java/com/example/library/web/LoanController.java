@@ -58,6 +58,12 @@ public class LoanController {
                         req.accessoryMissing(), req.note()));
     }
 
+    @PostMapping("/jobs/daily-overdue")
+    @Operation(summary = "（馆员/定时任务手动触发）逾期罚款累计与到期提醒；争议申诉中的借阅跳过（罚款冻结）")
+    public int dailyOverdueJob() {
+        return loans.runDailyOverdueJob();
+    }
+
     @GetMapping("/readers/{cardNo}/active")
     @Operation(summary = "读者当前借阅")
     public List<LoanView> active(@PathVariable String cardNo) {

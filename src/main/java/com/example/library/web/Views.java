@@ -47,14 +47,45 @@ public final class Views {
                 f.getLoan() == null ? null : f.getLoan().getId(),
                 f.getTask() == null ? null : f.getTask().getId(),
                 f.getType().name(), f.getChargedTo().name(), f.getAmount(), f.getStatus().name(),
-                f.getReason(), f.getRuleBasis(), f.getCreatedAt(), f.getResolvedAt());
+                f.getReason(), f.getRuleBasis(), f.getCreatedAt(), f.getResolvedAt(),
+                f.getFrozenClaimId() != null, f.getFrozenClaimId());
     }
 
     public static ClaimView claim(Claim c) {
+        return claim(c, null);
+    }
+
+    /** @param frozenFine 该工单当前冻结的逾期罚款（可为 null） */
+    public static ClaimView claim(Claim c, Fine frozenFine) {
         Loan l = c.getLoan();
         return new ClaimView(c.getId(), l.getId(), c.getReader().getCardNo(),
                 l.getItem().getBarcode(), l.getItem().getBib().getTitle(),
-                c.getStatus().name(), c.getNote(), c.getStaff(), c.getCreatedAt(), c.getResolvedAt());
+                c.getStatus().name(), c.getNote(), c.getStaff(), c.getCreatedAt(), c.getResolvedAt(),
+                c.getMachineCode(),
+                c.getKioskCheck() == null ? null : c.getKioskCheck().name(),
+                c.getKioskLog() == null ? null : c.getKioskLog().getId(),
+                c.getKioskNote(),
+                c.getCameraRef(),
+                c.getCameraCheck() == null ? null : c.getCameraCheck().name(),
+                c.getCameraNote(),
+                c.getBinCheck() == null ? null : c.getBinCheck().name(),
+                c.getBinCountAt(), c.getBinNote(),
+                c.getShelfCheck() == null ? null : c.getShelfCheck().name(),
+                c.getShelfRecordedAt(), c.getShelfNote(),
+                c.getFrozenAt(), c.getLiability(), c.getClosedAt(),
+                l.getStatus().name(), l.getDueDate(),
+                frozenFine != null, frozenFine == null ? null : frozenFine.getAmount());
+    }
+
+    public static KioskLogView kioskLog(SelfCheckinLog l) {
+        return new KioskLogView(l.getId(), l.getMachineCode(), l.getLibrary().getCode(),
+                l.getItemBarcode(), l.getResult(), l.getOccurredAt(), l.getBinNo(),
+                l.getCameraRef(), l.getNote());
+    }
+
+    public static EvidenceView evidence(ClaimEvidence e) {
+        return new EvidenceView(e.getId(), e.getClaim().getId(), e.getSource(), e.getKind(),
+                e.getContent(), e.getStaff(), e.getCreatedAt());
     }
 
     public static NotificationView notification(Notification n) {

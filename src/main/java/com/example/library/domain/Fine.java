@@ -54,4 +54,11 @@ public class Fine {
 
     @Column(name = "resolved_at")
     private Instant resolvedAt;
+
+    /** 被哪条申诉冻结：非空时罚款挂起，不随逾期增长、不催收 */
+    @Column(name = "frozen_claim_id")
+    private Long frozenClaimId;
+
+    @Column(name = "frozen_at")
+    private Instant frozenAt;
 }

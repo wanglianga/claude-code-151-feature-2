@@ -14,4 +14,6 @@ public interface FineRepository extends JpaRepository<Fine, Long> {
     List<Fine> findByTaskId(Long taskId);
 
     List<Fine> findByStatusOrderByCreatedAt(FineStatus status);
+
+    List<Fine> findByFrozenClaimId(Long frozenClaimId);
 }
