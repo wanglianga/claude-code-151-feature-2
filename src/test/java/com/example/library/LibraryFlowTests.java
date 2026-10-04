@@ -31,6 +31,9 @@ class LibraryFlowTests {
     @Autowired TransferService transferService;
     @Autowired LoanService loanService;
     @Autowired FineService fineService;
+    @Autowired ClaimService claimService;
+    @Autowired KioskService kioskService;
+    @Autowired CreditService creditService;
     @Autowired CatalogService catalog;
     @Autowired PolicyService policy;
     @Autowired LibraryAdminService libraryAdmin;
@@ -42,6 +45,8 @@ class LibraryFlowTests {
     @Autowired LoanRepository loans;
     @Autowired FineRepository fines;
     @Autowired ClaimRepository claims;
+    @Autowired ClaimEvidenceRepository claimEvidences;
+    @Autowired ReaderRepository readers;
 
     private Instant t0;
 
@@ -282,46 +287,142 @@ class LibraryFlowTests {
         assertEquals(0, central.availableCopies());
     }
 
-    // ---------- 9. “声称已还”：找到则入库并豁免；未找到按赔书；人工调整留痕 ----------
+    // ---------- 9. “已还未入库”申诉：扫描失败找到撤罚修信用 / 未找到保持争议 / 终判按原到期日 ----------
 
     @Test
-    void claimReturned_foundWaivedOverdue_notFoundChargesReplacement_adjustAudited() {
+    void claim_scanFailFound_waivesFineFixesInventoryRepairsCredit() {
         Loan loan = loanService.checkout("R002", "J-0001", "CENTRAL");
+        Long readerId = loan.getReader().getId();
+        clock.setFixed(t0.plus(40, ChronoUnit.DAYS)); // 逾期 10 天 → 5 元
+        Fine overdue = fineService.refreshOverdueFine(loan);
+        assertEquals(0, new BigDecimal("5.00").compareTo(overdue.getAmount()));
+        assertEquals(90, creditService.score(readerId), "逾期首次产生信用扣减 10 分");
+
+        // 读者申诉：罚款冻结、借阅进入争议、信用不立即恢复
+        Claim claim = claimService.openClaim(loan.getId(), "NORTH-K01",
+                t0.plus(31, ChronoUnit.DAYS), "当晚在城北自助机还的，机器响了一声");
+        assertEquals(ClaimStatus.OPEN, claims.findById(claim.getId()).orElseThrow().getStatus());
+        assertEquals(LoanStatus.CLAIMED_RETURNED, loans.findById(loan.getId()).orElseThrow().getStatus());
+        assertTrue(fines.findById(overdue.getId()).orElseThrow().isGrowthHold());
+        assertEquals(90, creditService.score(readerId), "核查期间信用不恢复");
+
+        // 时间继续走，但冻结期间罚款不再增长
+        clock.setFixed(t0.plus(60, ChronoUnit.DAYS));
+        fineService.refreshOverdueFine(loans.findById(loan.getId()).orElseThrow());
+        assertEquals(0, new BigDecimal("5.00").compareTo(
+                fines.findById(overdue.getId()).orElseThrow().getAmount()));
+
+        // 自助机上报扫描失败日志，馆员核查后确认书已在书箱找到
+        KioskLog log = kioskService.ingest("NORTH", "NORTH-K01", "SCAN_FAIL",
+                "J-0001", "R002", t0.plus(31, ChronoUnit.DAYS), "读头识别失败，图书已落入书箱");
+        claimService.resolveScanFailFound(claim.getId(), "CENTRAL", "馆员老李",
+                log.getId(), "CAM-NORTH-1002", "10 月 3 日开箱清点第 2 架位找到");
+
+        Claim resolved = claims.findById(claim.getId()).orElseThrow();
+        assertEquals(ClaimStatus.FOUND, resolved.getStatus());
+        assertEquals(ClaimOutcome.LIBRARY_MISSED_CHECKIN, resolved.getOutcome());
+        assertTrue(resolved.getCreditRepaired());
+        assertEquals(LoanStatus.RETURNED, loans.findById(loan.getId()).orElseThrow().getStatus());
+        assertEquals(ItemStatus.AVAILABLE, items.findByBarcode("J-0001").orElseThrow().getStatus(),
+                "无人排队则修正库存后在找到馆上架");
+        Fine waived = fines.findById(overdue.getId()).orElseThrow();
+        assertEquals(FineStatus.WAIVED, waived.getStatus());
+        assertEquals(0, BigDecimal.ZERO.compareTo(waived.getAmount()));
+        assertFalse(waived.isGrowthHold());
+        assertEquals(100, creditService.score(readerId), "馆方责任：信用记录同步修复");
+
+        // 证据链完整：机日志 / 监控编号 / 书箱清点 / 入库记录
+        var kinds = claimEvidences.findByClaimIdOrderByCreatedAt(claim.getId()).stream()
+                .map(e -> e.getKind()).toList();
+        assertTrue(kinds.contains(EvidenceKind.KIOSK_LOG));
+        assertTrue(kinds.contains(EvidenceKind.CAMERA));
+        assertTrue(kinds.contains(EvidenceKind.BIN_COUNT));
+        assertTrue(kinds.contains(EvidenceKind.CHECKIN_RECORD));
+    }
+
+    @Test
+    void claim_keepDisputedReaderReopens_upholdChargesFromOriginalDueDate() {
+        Loan loan = loanService.checkout("R003", "J-0002", "WEST");
+        Long readerId = loan.getReader().getId();
+        clock.setFixed(t0.plus(35, ChronoUnit.DAYS)); // 逾期 5 天 → 2.5 元
+        Fine overdue = fineService.refreshOverdueFine(loan);
+        assertEquals(0, new BigDecimal("2.50").compareTo(overdue.getAmount()));
+
+        Claim claim = claimService.openClaim(loan.getId(), "WEST-K02", null, "确定还了");
+        // 暂未找到：保持争议，罚款继续暂缓、信用继续暂扣
+        claimService.keepDisputed(claim.getId(), "馆员老李", "当班书箱已清点，未见此书");
+        assertEquals(ClaimStatus.DISPUTED, claims.findById(claim.getId()).orElseThrow().getStatus());
+        assertTrue(fines.findById(overdue.getId()).orElseThrow().isGrowthHold());
+        assertEquals(90, creditService.score(readerId));
+
+        // 读者继续提供证据 → 工单回到 OPEN 重新核查
+        claimService.addReaderEvidence(claim.getId(), "READER",
+                "找到当晚照片，监控可查 19:00-19:30 时段", "PHOTO-2026-1104");
+        assertEquals(ClaimStatus.OPEN, claims.findById(claim.getId()).orElseThrow().getStatus());
+
+        // 终判读者责任：冻结解除，按原到期日补算（此时逾期 15 天 → 7.5 元）
+        clock.setFixed(t0.plus(45, ChronoUnit.DAYS));
+        claimService.upholdReaderResponsible(claim.getId(), "馆员老李",
+                "监控仅见投递动作未见书入箱，跨班书箱多次清点均无此书");
+        Claim done = claims.findById(claim.getId()).orElseThrow();
+        assertEquals(ClaimStatus.NOT_FOUND, done.getStatus());
+        assertEquals(ClaimOutcome.READER_RESPONSIBLE, done.getOutcome());
+        assertNull(done.getCreditRepaired(), "读者责任不修复信用标记");
+        assertEquals(LoanStatus.LOST, loans.findById(loan.getId()).orElseThrow().getStatus());
+        assertEquals(ItemStatus.LOST, items.findByBarcode("J-0002").orElseThrow().getStatus());
+
+        Fine settled = fines.findById(overdue.getId()).orElseThrow();
+        assertFalse(settled.isGrowthHold());
+        assertEquals(0, new BigDecimal("7.50").compareTo(settled.getAmount()),
+                "按原到期日计算：暂缓的 10 天照常计入（15×0.5）");
+        Fine replacement = fines.findByLoanId(loan.getId()).stream()
+                .filter(f -> f.getType() == FineType.LOST).findFirst().orElseThrow();
+        assertEquals(0, new BigDecimal("50.00").compareTo(replacement.getAmount()));
+        assertEquals(60, creditService.score(readerId), "逾期 -10、丢书 -30，信用不恢复");
+
+        // 人工调减仍须审计留痕
+        Fine reduced = fineService.adjust(replacement.getId(), "馆员老李", "REDUCE", 30.0,
+                "读者首次丢书，人文关怀调减");
+        assertEquals(FineStatus.REDUCED, reduced.getStatus());
+        assertEquals(1, fineService.adjustmentHistory(replacement.getId()).size());
+    }
+
+    @Test
+    void claim_libraryMissedCheckin_waivesFineAndRepairsCredit() {
+        Loan loan = loanService.checkout("R001", "P-0001", "NORTH");
+        Long readerId = loan.getReader().getId();
         clock.setFixed(t0.plus(40, ChronoUnit.DAYS));
         fineService.refreshOverdueFine(loan);
-        Claim claim = loanService.claimReturned(loan.getId(), "确定还到服务台了");
-        assertEquals(LoanStatus.CLAIMED_RETURNED, loans.findById(loan.getId()).orElseThrow().getStatus());
+        Claim claim = claimService.openClaim(loan.getId(), null, null, null);
 
-        // 馆员在架上找到：入库 + 逾期罚款豁免
-        loanService.resolveClaimFound(claim.getId(), "CENTRAL", "馆员老李");
+        claimService.confirmLibraryMissedCheckin(claim.getId(), "NORTH", "馆员老李",
+                "监控证实读者已投入还书箱，系当班馆员漏扫码入库");
+        Claim done = claims.findById(claim.getId()).orElseThrow();
+        assertEquals(ClaimStatus.WAIVED, done.getStatus());
+        assertEquals(ClaimOutcome.LIBRARY_MISSED_CHECKIN, done.getOutcome());
+        assertTrue(done.getCreditRepaired());
         assertEquals(LoanStatus.RETURNED, loans.findById(loan.getId()).orElseThrow().getStatus());
-        Fine overdue = fines.findAll().stream()
-                .filter(x -> x.getType() == FineType.OVERDUE).findFirst().orElseThrow();
-        assertEquals(FineStatus.WAIVED, overdue.getStatus());
-
-        // 另一册：核查期满未找到 → 赔书价 50，馆员再调减为 30 并留痕
-        Loan loan2 = loanService.checkout("R003", "J-0002", "WEST");
-        Claim claim2 = loanService.claimReturned(loan2.getId(), null);
-        loanService.resolveClaimNotFound(claim2.getId(), "馆员老李");
-        assertEquals(LoanStatus.LOST, loans.findById(loan2.getId()).orElseThrow().getStatus());
-        assertEquals(ItemStatus.LOST, items.findByBarcode("J-0002").orElseThrow().getStatus());
-        Fine replacement = fines.findAll().stream()
-                .filter(x -> x.getType() == FineType.LOST).findFirst().orElseThrow();
-        assertEquals(0, new BigDecimal("50.00").compareTo(replacement.getAmount()));
-
-        Fine reduced = fineService.adjust(replacement.getId(), "馆员老李", "REDUCE", 30.0,
-                "读者为残障人士且首次丢书，人文关怀调减");
-        assertEquals(0, new BigDecimal("30.00").compareTo(reduced.getAmount()));
-        assertEquals(FineStatus.REDUCED, reduced.getStatus());
-        var history = fineService.adjustmentHistory(reduced.getId());
-        assertEquals(1, history.size());
-        assertEquals("馆员老李", history.get(0).getStaff());
-        assertEquals(0, new BigDecimal("50.00").compareTo(history.get(0).getOldAmount()));
-
-        // 无理由调整必须被拒绝
-        assertThrows(ApiException.class,
-                () -> fineService.adjust(reduced.getId(), "馆员老李", "WAIVE", null, "  "));
+        assertEquals(100, creditService.score(readerId));
+        assertTrue(fines.findByLoanId(loan.getId()).stream()
+                .allMatch(f -> f.getStatus() == FineStatus.WAIVED));
     }
+
+    @Test
+    void claim_physicalReturnAutoCloses_fineWaivedAndCreditRepaired() {
+        Loan loan = loanService.checkout("R002", "H-0002", "NORTH");
+        Long readerId = loan.getReader().getId();
+        clock.setFixed(t0.plus(34, ChronoUnit.DAYS));
+        fineService.refreshOverdueFine(loan);
+        Claim claim = claimService.openClaim(loan.getId(), "NORTH-K01", null, "还到城北了");
+
+        // 图书在另一次还书核验中被发现（漏入库的书重新出现）
+        loanService.returnBook("H-0002", "CENTRAL",
+                new LoanService.ReturnAssessment(false, false, false, "书箱深处找出"));
+        assertEquals(ClaimStatus.FOUND, claims.findById(claim.getId()).orElseThrow().getStatus());
+        assertEquals(LoanStatus.RETURNED, loans.findById(loan.getId()).orElseThrow().getStatus());
+        assertEquals(100, creditService.score(readerId));
+    }
+
 
     // ---------- 10. 临时闭馆：取书时限与临期应还日期自动顺延 ----------
 

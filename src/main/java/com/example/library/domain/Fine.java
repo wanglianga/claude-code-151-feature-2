@@ -49,6 +49,10 @@ public class Fine {
     @Column(name = "rule_basis")
     private String ruleBasis;
 
+    /** 申诉核查期间暂缓日增长：金额冻结在受理时刻，不减免；结案后按责任方解冻/撤销 */
+    @Column(name = "growth_hold", nullable = false)
+    private boolean growthHold = false;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

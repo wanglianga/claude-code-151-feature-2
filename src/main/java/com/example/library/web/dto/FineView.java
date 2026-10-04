@@ -12,6 +12,8 @@ public record FineView(
         String chargedTo,
         BigDecimal amount,
         String status,
+        /** 申诉核查期间暂缓日增长 */
+        boolean growthHold,
         String reason,
         String ruleBasis,
         Instant createdAt,

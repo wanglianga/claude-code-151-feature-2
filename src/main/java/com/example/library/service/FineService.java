@@ -23,14 +23,17 @@ public class FineService {
     private final PolicyService policy;
     private final AppClock clock;
     private final NotificationService notifications;
+    private final CreditService credit;
 
     public FineService(FineRepository fines, FineAdjustmentRepository adjustments,
-                       PolicyService policy, AppClock clock, NotificationService notifications) {
+                       PolicyService policy, AppClock clock, NotificationService notifications,
+                       CreditService credit) {
         this.fines = fines;
         this.adjustments = adjustments;
         this.policy = policy;
         this.clock = clock;
         this.notifications = notifications;
+        this.credit = credit;
     }
 
     public static String money(double v) {
@@ -71,11 +74,21 @@ public class FineService {
     /**
      * 根据当前时间刷新某笔借阅的逾期罚款（一笔借阅始终只挂一条 OPEN 的 OVERDUE 罚款，
      * 金额随天数增长直到上限），供定时任务与还书结算共用。
+     * 申诉核查期间（growth_hold=true）金额冻结，不随天数增长——暂缓不等于减免。
      */
     @Transactional
     public Fine refreshOverdueFine(Loan loan) {
+        return refreshOverdueFine(loan, loan.getDueDate());
+    }
+
+    /**
+     * 按指定起算日刷新逾期金额。读者责任终判时以<b>原到期日</b>起算
+     * （申诉暂缓的天数照常计入），不因争议而减免。
+     */
+    @Transactional
+    public Fine refreshOverdueFine(Loan loan, Instant basisDueDate) {
         Instant now = clock.now();
-        long days = overdueDays(loan.getDueDate(), now);
+        long days = overdueDays(basisDueDate, now);
         List<Fine> existing = fines.findByLoanId(loan.getId()).stream()
                 .filter(f -> f.getType() == FineType.OVERDUE && f.getStatus() != FineStatus.PAID
                         && f.getStatus() != FineStatus.WAIVED)
@@ -87,13 +100,54 @@ public class FineService {
         String reason = "《" + loan.getItem().getBib().getTitle() + "》条码 " + loan.getItem().getBarcode()
                 + " 已逾期 " + days + " 天（应还 " + loan.getDueDate() + "）";
         if (existing.isEmpty()) {
-            return create(loan.getReader(), FineType.OVERDUE, ChargedTo.READER, amount,
+            Fine f = create(loan.getReader(), FineType.OVERDUE, ChargedTo.READER, amount,
                     reason, overdueBasis(), loan, null);
+            credit.recordOverduePenaltyIfNeeded(loan);
+            return f;
         }
         Fine f = existing.get(0);
+        if (f.isGrowthHold()) {
+            return f; // 申诉核查期间：金额暂缓增长
+        }
         f.setAmount(BigDecimal.valueOf(amount).setScale(2, RoundingMode.HALF_UP));
         f.setReason(reason);
         return f;
+    }
+
+    /**
+     * 受理“已还未入库”申诉：冻结该借阅逾期罚款的日增长。
+     * 若此时逾期罚款尚未生成（读者在每日批处理前申诉），按当前逾期天数先建单再冻结，
+     * 保证暂缓金额可向读者明示。
+     */
+    @Transactional
+    public void freezeOverdueGrowth(Loan loan) {
+        List<Fine> overdue = fines.findByLoanId(loan.getId()).stream()
+                .filter(f -> f.getType() == FineType.OVERDUE
+                        && (f.getStatus() == FineStatus.OPEN || f.getStatus() == FineStatus.REDUCED))
+                .toList();
+        if (overdue.isEmpty()) {
+            Fine f = refreshOverdueFine(loan);
+            if (f != null) {
+                f.setGrowthHold(true);
+            }
+            return;
+        }
+        overdue.forEach(f -> f.setGrowthHold(true));
+    }
+
+    /** 解除暂缓：后续日累计恢复 */
+    @Transactional
+    public void unfreezeOverdueGrowth(Loan loan) {
+        fines.findByLoanId(loan.getId()).stream()
+                .filter(f -> f.getType() == FineType.OVERDUE)
+                .forEach(f -> f.setGrowthHold(false));
+    }
+
+    /** 读者责任终判：解除暂缓并按原到期日补算申诉期间暂缓增长的金额 */
+    @Transactional
+    public Fine resumeOverdueFromOriginalDueDate(Loan loan) {
+        unfreezeOverdueGrowth(loan);
+        return refreshOverdueFine(loan, loan.getDueDate());
     }
 
     @Transactional
@@ -138,6 +192,7 @@ public class FineService {
             throw ApiException.unprocessable("action 仅支持 REDUCE / WAIVE");
         }
         f.setAmount(target);
+        f.setGrowthHold(false); // 人工调整即结案，不再受申诉暂缓控制
         f.setResolvedAt(clock.now());
 
         FineAdjustment a = new FineAdjustment();

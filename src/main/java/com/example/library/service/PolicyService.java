@@ -33,7 +33,10 @@ public class PolicyService {
             Map.entry("transfer.sameRegionHours", 24.0),
             Map.entry("transfer.otherRegionHours", 72.0),
             Map.entry("transfer.protectionRatio", 0.5),
-            Map.entry("closure.graceHours", 24.0)
+            Map.entry("closure.graceHours", 24.0),
+            Map.entry("credit.baseScore", 100.0),
+            Map.entry("credit.overduePenalty", 10.0),
+            Map.entry("credit.lostPenalty", 30.0)
     );
 
     public PolicyService(PolicyRepository policies) {
@@ -61,6 +64,9 @@ public class PolicyService {
     public double feeLogisticsLoss() { return get("fee.logisticsLoss"); }
     public double protectionRatio()  { return get("transfer.protectionRatio"); }
     public long closureGraceHours()  { return (long) get("closure.graceHours"); }
+    public int creditBaseScore()     { return (int) get("credit.baseScore"); }
+    public int creditOverduePenalty() { return (int) get("credit.overduePenalty"); }
+    public int creditLostPenalty()   { return (int) get("credit.lostPenalty"); }
 
     public long etaHours(boolean sameRegion) {
         return (long) get(sameRegion ? "transfer.sameRegionHours" : "transfer.otherRegionHours");

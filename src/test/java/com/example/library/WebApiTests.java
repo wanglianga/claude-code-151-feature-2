@@ -95,4 +95,24 @@ class WebApiTests {
         mvc.perform(get("/api/admin/policies")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.['fine.daily']").value(0.5));
     }
+
+    @Test
+    void returnedNotCheckedInClaimEndpoints_areAvailable() throws Exception {
+        // 种子已写入 R004 借阅 C-0002 逾期、自助机 SCAN_FAIL 日志（V3 演示数据）
+        mvc.perform(get("/api/kiosk-logs").param("itemBarcode", "C-0002"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].eventType").value("SCAN_FAIL"))
+                .andExpect(jsonPath("$[0].kioskCode").value("NORTH-K01"));
+
+        mvc.perform(get("/api/credit/readers/R004")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.score").value(100));
+
+        mvc.perform(get("/api/claims/open")).andExpect(status().isOk());
+
+        // 馆员结案请求参数缺失（staff 必填）→ 400
+        mvc.perform(post("/api/claims/1/keep-disputed")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest());
+    }
 }

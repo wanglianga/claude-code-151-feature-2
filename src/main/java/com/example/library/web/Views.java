@@ -47,6 +47,7 @@ public final class Views {
                 f.getLoan() == null ? null : f.getLoan().getId(),
                 f.getTask() == null ? null : f.getTask().getId(),
                 f.getType().name(), f.getChargedTo().name(), f.getAmount(), f.getStatus().name(),
+                f.isGrowthHold(),
                 f.getReason(), f.getRuleBasis(), f.getCreatedAt(), f.getResolvedAt());
     }
 
@@ -54,7 +55,10 @@ public final class Views {
         Loan l = c.getLoan();
         return new ClaimView(c.getId(), l.getId(), c.getReader().getCardNo(),
                 l.getItem().getBarcode(), l.getItem().getBib().getTitle(),
-                c.getStatus().name(), c.getNote(), c.getStaff(), c.getCreatedAt(), c.getResolvedAt());
+                c.getStatus().name(), c.getKioskCode(), c.getClaimedReturnedAt(), c.getHeldAt(),
+                c.getOutcome() == null ? null : c.getOutcome().name(),
+                c.getCreditRepaired(),
+                c.getNote(), c.getStaff(), c.getCreatedAt(), c.getResolvedAt());
     }
 
     public static NotificationView notification(Notification n) {

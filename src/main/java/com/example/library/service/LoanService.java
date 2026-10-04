@@ -4,7 +4,6 @@ import com.example.library.domain.*;
 import com.example.library.repo.*;
 import com.example.library.web.ApiException;
 import com.example.library.web.Views;
-import com.example.library.web.dto.ClaimView;
 import com.example.library.web.dto.LoanView;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,26 +25,27 @@ public class LoanService {
     private final ReaderRepository readers;
     private final LibraryRepository libraries;
     private final HoldRepository holds;
-    private final ClaimRepository claims;
     private final PolicyService policy;
     private final FineService fines;
     private final HoldService holdService;
+    private final ClaimService claims;
     private final NotificationService notifications;
     private final AppClock clock;
 
     public LoanService(LoanRepository loans, ItemRepository items, ReaderRepository readers,
-                       LibraryRepository libraries, HoldRepository holds, ClaimRepository claims,
+                       LibraryRepository libraries, HoldRepository holds,
                        PolicyService policy, FineService fines, HoldService holdService,
+                       ClaimService claims,
                        NotificationService notifications, AppClock clock) {
         this.loans = loans;
         this.items = items;
         this.readers = readers;
         this.libraries = libraries;
         this.holds = holds;
-        this.claims = claims;
         this.policy = policy;
         this.fines = fines;
         this.holdService = holdService;
+        this.claims = claims;
         this.notifications = notifications;
         this.clock = clock;
     }
@@ -91,9 +91,11 @@ public class LoanService {
         Library lib = libraries.findByCode(libraryCode)
                 .orElseThrow(() -> ApiException.notFound("分馆不存在: " + libraryCode));
 
-        long overdueCount = loans.countOverdueForReader(reader.getId(), LoanStatus.ACTIVE, clock.now());
+        long overdueCount = loans.countOverdueForReader(reader.getId(), LoanStatus.ACTIVE, clock.now())
+                + loans.countOverdueForReader(reader.getId(), LoanStatus.CLAIMED_RETURNED, clock.now());
         if (overdueCount > 0) {
-            throw ApiException.unprocessable("您有 " + overdueCount + " 册逾期未还图书，请先归还后再借书");
+            throw ApiException.unprocessable("您有 " + overdueCount + " 册逾期未还（含已还未入库申诉核查中）图书，"
+                    + "请先归还或等待申诉核查结论后再借书");
         }
 
         Instant due = clock.now().plus(policy.loanPeriodDays(), ChronoUnit.DAYS);
@@ -189,12 +191,8 @@ public class LoanService {
                     "缺附件", "fee.accessory=" + FineService.money(policy.feeAccessory()) + " 元/件");
         }
 
-        // 关联的待处理“声称已还”工单自动结案
-        claims.findFirstByLoanIdAndStatus(loan.getId(), ClaimStatus.OPEN).ifPresent(c -> {
-            c.setStatus(ClaimStatus.FOUND);
-            c.setResolvedAt(now);
-            c.setNote((c.getNote() == null ? "" : c.getNote() + "；") + "图书实际归还入库");
-        });
+        // 关联的“已还未入库”申诉在图书实际核验出现时自动结案（馆方责任：撤罚 + 修信用）
+        claims.autoCloseOnPhysicalReturn(loan, lib);
 
         if (unfit) {
             // 污损/缺页图书不参与再分配，转维修/注销评估
@@ -216,130 +214,7 @@ public class LoanService {
                         + "，按规则需赔偿 " + FineService.money(amount) + " 元。如有异议可到馆申诉。");
     }
 
-    // ---------------- “声称已还”争议 ----------------
-
-    @Transactional
-    public Claim claimReturned(Long loanId, String note) {
-        Loan loan = loans.findById(loanId)
-                .orElseThrow(() -> ApiException.notFound("借阅单不存在: " + loanId));
-        if (loan.getStatus() != LoanStatus.ACTIVE) {
-            throw ApiException.conflict("借阅单状态为 " + loan.getStatus() + "，不能提交声称已还");
-        }
-        claims.findFirstByLoanIdAndStatus(loanId, ClaimStatus.OPEN).ifPresent(c -> {
-            throw ApiException.conflict("该借阅单已有进行中的核查工单 #" + c.getId());
-        });
-        Claim c = new Claim();
-        c.setLoan(loan);
-        c.setReader(loan.getReader());
-        c.setStatus(ClaimStatus.OPEN);
-        c.setNote(note);
-        c.setCreatedAt(clock.now());
-        claims.save(c);
-
-        loan.setStatus(LoanStatus.CLAIMED_RETURNED);
-        notifications.notify(loan.getReader(), "CLAIM", "已还声明已受理",
-                "我们已受理您关于《" + loan.getItem().getBib().getTitle() + "》的已还声明，"
-                        + "馆员将核查上架记录；核查期间暂停累计逾期罚款。");
-        return c;
-    }
-
-    /** 馆员在书架找到：图书正常入库，借阅结案；逾期罚款视为馆方流程原因予以豁免 */
-    @Transactional
-    public Claim resolveClaimFound(Long claimId, String foundLibraryCode, String staff) {
-        Claim c = mustOpenClaim(claimId);
-        Library lib = libraries.findByCode(foundLibraryCode)
-                .orElseThrow(() -> ApiException.notFound("分馆不存在: " + foundLibraryCode));
-        Loan loan = c.getLoan();
-        Item item = items.lockById(loan.getItem().getId()).orElseThrow();
-        Instant now = clock.now();
-
-        c.setStatus(ClaimStatus.FOUND);
-        c.setStaff(staff);
-        c.setResolvedAt(now);
-        c.setNote((c.getNote() == null ? "" : c.getNote() + "；") + "馆员在" + lib.getName() + "找到并入库");
-
-        loan.setStatus(LoanStatus.RETURNED);
-        loan.setReturnedAt(now);
-        loan.setReturnedLibrary(lib);
-        item.setCurrentLibrary(lib);
-
-        fines.forLoan(loan.getId()).stream()
-                .filter(f -> f.getType() == FineType.OVERDUE && f.getStatus() == FineStatus.OPEN)
-                .forEach(f -> fines.adjust(f.getId(), staff, "WAIVE", null,
-                        "读者声称已还且馆员在馆内找到，逾期为上架流程延误，豁免读者罚款"));
-
-        notifications.notify(loan.getReader(), "CLAIM", "核查结果：书已找到",
-                "您声明已还的《" + item.getBib().getTitle() + "》已在" + lib.getName()
-                        + "找到，逾期罚款已豁免，感谢配合。");
-        holdService.reallocate(item.getId(), lib);
-        return c;
-    }
-
-    /** 逾期未找到：按丢书赔书处理（人工可再调减/豁免），该书从预约流转中退出 */
-    @Transactional
-    public Claim resolveClaimNotFound(Long claimId, String staff) {
-        Claim c = mustOpenClaim(claimId);
-        Loan loan = c.getLoan();
-        Item item = items.lockById(loan.getItem().getId()).orElseThrow();
-        Instant now = clock.now();
-
-        c.setStatus(ClaimStatus.NOT_FOUND);
-        c.setStaff(staff);
-        c.setResolvedAt(now);
-        loan.setStatus(LoanStatus.LOST);
-        item.setStatus(ItemStatus.LOST);
-
-        fines.create(loan.getReader(), FineType.LOST, ChargedTo.READER, policy.feeReplacement(),
-                "《" + item.getBib().getTitle() + "》条码 " + item.getBarcode()
-                        + " 声称已还核查期满未找到，按丢书赔书",
-                "fee.replacement=" + FineService.money(policy.feeReplacement())
-                        + " 元/册（如事后找到可凭记录申诉退还）",
-                loan, null);
-        notifications.notify(loan.getReader(), "FINE_OPEN", "核查结果：图书未找到",
-                "您声明已还的《" + item.getBib().getTitle() + "》核查期满未找到，"
-                        + "按规则需赔书 " + FineService.money(policy.feeReplacement())
-                        + " 元。如日后图书找到，可凭工单号 #" + c.getId() + " 申诉。");
-        return c;
-    }
-
-    /** 馆方豁免结案（如监控证实已投入还书箱但处置失误），图书按馆藏正常流转 */
-    @Transactional
-    public Claim waiveClaim(Long claimId, String staff, String reason, String foundLibraryCode) {
-        if (reason == null || reason.isBlank()) {
-            throw ApiException.unprocessable("豁免必须填写理由");
-        }
-        Claim c = mustOpenClaim(claimId);
-        Library lib = libraries.findByCode(foundLibraryCode)
-                .orElseThrow(() -> ApiException.notFound("分馆不存在: " + foundLibraryCode));
-        Loan loan = c.getLoan();
-        Item item = items.lockById(loan.getItem().getId()).orElseThrow();
-        Instant now = clock.now();
-
-        c.setStatus(ClaimStatus.WAIVED);
-        c.setStaff(staff);
-        c.setResolvedAt(now);
-        c.setNote((c.getNote() == null ? "" : c.getNote() + "；") + "馆方豁免：" + reason);
-        loan.setStatus(LoanStatus.RETURNED);
-        loan.setReturnedAt(now);
-        loan.setReturnedLibrary(lib);
-        item.setCurrentLibrary(lib);
-
-        fines.forLoan(loan.getId()).stream()
-                .filter(f -> f.getStatus() == FineStatus.OPEN)
-                .forEach(f -> fines.adjust(f.getId(), staff, "WAIVE", null,
-                        "声称已还争议馆方豁免：" + reason));
-        holdService.reallocate(item.getId(), lib);
-        return c;
-    }
-
-    private Claim mustOpenClaim(Long claimId) {
-        Claim c = claims.findById(claimId)
-                .orElseThrow(() -> ApiException.notFound("核查工单不存在: " + claimId));
-        if (c.getStatus() != ClaimStatus.OPEN) {
-            throw ApiException.conflict("工单已结案：" + c.getStatus());
-        }
-        return c;
-    }
+    // ---------------- “已还未入库”申诉由 ClaimService 负责 ----------------
 
     @Transactional(readOnly = true)
     public List<LoanView> activeLoanViews(String cardNo) {
@@ -361,26 +236,6 @@ public class LoanService {
         return Views.loan(returnBook(barcode, libraryCode, assessment));
     }
 
-    @Transactional
-    public ClaimView claimView(Long loanId, String note) {
-        return Views.claim(claimReturned(loanId, note));
-    }
-
-    @Transactional
-    public ClaimView resolveFoundView(Long claimId, String code, String staff) {
-        return Views.claim(resolveClaimFound(claimId, code, staff));
-    }
-
-    @Transactional
-    public ClaimView resolveNotFoundView(Long claimId, String staff) {
-        return Views.claim(resolveClaimNotFound(claimId, staff));
-    }
-
-    @Transactional
-    public ClaimView waiveView(Long claimId, String staff, String reason, String code) {
-        return Views.claim(waiveClaim(claimId, staff, reason, code));
-    }
-
     @Transactional(readOnly = true)
     public List<Loan> activeForReader(String cardNo) {
         return loans.findByReaderCardNoAndStatusOrderByCheckedOutAtDesc(cardNo, LoanStatus.ACTIVE);
@@ -394,16 +249,6 @@ public class LoanService {
     @Transactional(readOnly = true)
     public Loan get(Long id) {
         return loans.findById(id).orElseThrow(() -> ApiException.notFound("借阅单不存在: " + id));
-    }
-
-    @Transactional(readOnly = true)
-    public List<Claim> openClaims() {
-        return claims.findByStatusOrderByCreatedAt(ClaimStatus.OPEN);
-    }
-
-    @Transactional(readOnly = true)
-    public List<ClaimView> openClaimViews() {
-        return openClaims().stream().map(Views::claim).toList();
     }
 
     public Instant dueDate(Loan loan) {
